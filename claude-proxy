@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""claude-proxy: Per-session prompt-rewriting proxy for Claude Code.
+
+Starts a local HTTP proxy that rewrites system prompt strings in API requests,
+then launches claude through it. Proxy lives exactly as long as the claude session.
+
+Usage:
+    ./claude-proxy [any claude args]                   # Linux/Mac
+    python claude-proxy [any claude args]              # Windows
+    ./claude-proxy --verbose                           # debug logging
+    ./claude-proxy --claude-version=2.1.98             # use npm-installed version
+"""
+
+import http.server
+import json
+import logging
+import logging.handlers
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+IS_WINDOWS = sys.platform == "win32"
+
+# Enable ANSI escape sequences on Windows so Claude Code's TUI
+# (colors, spinners, cursor movement) renders correctly.
+if IS_WINDOWS:
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        # STD_OUTPUT_HANDLE = -11, ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x4
+        handle = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_ulong()
+        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        kernel32.SetConsoleMode(handle, mode.value | 0x4)
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# Default patches — overridden by patches.json if present
+# ---------------------------------------------------------------------------
+
+DEFAULT_PATCHES = [
+    {
+        "label": "Output efficiency — simplest approach bias",
+        "old": (
+            "IMPORTANT: Go straight to the point. Try the simplest approach "
+            "first without going in circles. Do not overdo it. Be extra concise."
+        ),
+        "new": (
+            "IMPORTANT: Go straight to the point without going in circles. "
+            "Choose the approach that correctly and completely solves the problem. "
+            "Do not add unnecessary complexity, but do not sacrifice correctness "
+            "or completeness for the sake of simplicity either."
+        ),
+    },
+    {
+        "label": "Brevity decoupled from work quality",
+        "old": (
+            "Keep your text output brief and direct. Lead with the answer or "
+            "action, not the reasoning. Skip filler words, preamble, and "
+            "unnecessary transitions. Do not restate what the user said \u2014 "
+            "just do it. When explaining, include only what is necessary for "
+            "the user to understand."
+        ),
+        "new": (
+            "Keep your text output brief and direct. Skip filler words, preamble, "
+            "and unnecessary transitions. Do not restate what the user said \u2014 "
+            "just do it. When explaining, include what is necessary for the user "
+            "to understand. Note: these communication guidelines apply to your "
+            "messages to the user, NOT to the thoroughness of your code changes "
+            "or investigation depth."
+        ),
+    },
+    {
+        "label": "One-sentence rule removed",
+        "old": (
+            "If you can say it in one sentence, don\u2019t use three. Prefer "
+            "short, direct sentences over long explanations. This does not "
+            "apply to code or tool calls."
+        ),
+        "new": (
+            "Prefer short, direct sentences over long explanations in your "
+            "messages. This does not apply to code, tool calls, or the "
+            "thoroughness of your implementation work."
+        ),
+    },
+    {
+        "label": "Anti-gold-plating \u2014 allow adjacent fixes",
+        "old": (
+            "Don\u2019t add features, refactor code, or make \u201cimprovements\u201d "
+            "beyond what was asked. A bug fix doesn\u2019t need surrounding code "
+            "cleaned up. A simple feature doesn\u2019t need extra configurability. "
+            "Don\u2019t add docstrings, comments, or type annotations to code you "
+            "didn\u2019t change. Only add comments where the logic isn\u2019t "
+            "self-evident."
+        ),
+        "new": (
+            "Don\u2019t add unrelated features or speculative improvements. "
+            "However, if adjacent code is broken, fragile, or directly "
+            "contributes to the problem being solved, fix it as part of the "
+            "task. A bug fix should address related issues discovered during "
+            "investigation. Don\u2019t add docstrings, comments, or type "
+            "annotations to code you didn\u2019t change. Only add comments "
+            "where the logic isn\u2019t self-evident."
+        ),
+    },
+    {
+        "label": "Error handling \u2014 stop skipping it",
+        "old": (
+            "Don\u2019t add error handling, fallbacks, or validation for "
+            "scenarios that can\u2019t happen. Trust internal code and framework "
+            "guarantees. Only validate at system boundaries (user input, "
+            "external APIs). Don\u2019t use feature flags or "
+            "backwards-compatibility shims when you can just change the code."
+        ),
+        "new": (
+            "Add error handling and validation at real boundaries where failures "
+            "can realistically occur (user input, external APIs, I/O, network). "
+            "Trust internal code and framework guarantees for truly internal "
+            "paths. Don\u2019t use feature flags or backwards-compatibility shims "
+            "when you can just change the code."
+        ),
+    },
+    {
+        "label": "Three-lines rule removed",
+        "old": "Three similar lines of code is better than a premature abstraction.",
+        "new": (
+            "Use judgment about when to extract shared logic. Avoid premature "
+            "abstractions for hypothetical reuse, but do extract when "
+            "duplication causes real maintenance risk."
+        ),
+    },
+    {
+        "label": "Subagent completeness strengthened",
+        "old": (
+            "Complete the task fully\u2014don\u2019t gold-plate, but don\u2019t "
+            "leave it half-done."
+        ),
+        "new": (
+            "Complete the task fully and thoroughly. Do the work that a careful "
+            "senior developer would do, including edge cases and fixing obviously "
+            "related issues you discover. Don\u2019t add purely cosmetic or "
+            "speculative improvements unrelated to the task."
+        ),
+    },
+    {
+        "label": "Explore agent \u2014 thoroughness over speed",
+        "old": (
+            "NOTE: You are meant to be a fast agent that returns output as "
+            "quickly as possible. In order to achieve this you must:\n"
+            "- Make efficient use of the tools that you have at your disposal: "
+            "be smart about how you search for files and implementations\n"
+            "- Wherever possible you should try to spawn multiple parallel tool "
+            "calls for grepping and reading files\n\n"
+            "Complete the user\u2019s search request efficiently and report "
+            "your findings clearly."
+        ),
+        "new": (
+            "NOTE: Be thorough in your exploration. Use efficient search "
+            "strategies but do not sacrifice completeness for speed:\n"
+            "- Make efficient use of the tools that you have at your disposal: "
+            "be smart about how you search for files and implementations\n"
+            "- Wherever possible you should try to spawn multiple parallel tool "
+            "calls for grepping and reading files\n"
+            "- When the caller requests \"very thorough\" exploration, exhaust "
+            "all reasonable search strategies before reporting\n\n"
+            "Complete the user\u2019s search request thoroughly and report "
+            "your findings clearly."
+        ),
+    },
+    {
+        "label": "Tone \u2014 remove short and concise",
+        "old": "Your responses should be short and concise.",
+        "new": (
+            "Your responses should be clear and appropriately detailed for "
+            "the complexity of the task."
+        ),
+    },
+    {
+        "label": "Subagent code snippets \u2014 stop suppressing context",
+        "old": (
+            "Include code snippets only when the exact text is load-bearing "
+            "(e.g., a bug you found, a function signature the caller asked "
+            "for) \u2014 do not recap code you merely read."
+        ),
+        "new": (
+            "Include code snippets when they provide useful context (e.g., "
+            "bugs found, function signatures, relevant patterns, code that "
+            "informs the decision). Summarize rather than quoting large "
+            "blocks verbatim."
+        ),
+    },
+    {
+        "label": "Scope matching \u2014 allow related work",
+        "old": "Match the scope of your actions to what was actually requested.",
+        "new": (
+            "Match the scope of your actions to what was actually requested, "
+            "but do address closely related issues you discover during the "
+            "work when fixing them is clearly the right thing to do."
+        ),
+    },
+]
+
+UPSTREAM_HOST = "api.anthropic.com"
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+log = logging.getLogger("claude-proxy")
+
+
+def setup_logging(verbose: bool = False) -> None:
+    log_dir = Path.home() / ".claude-proxy"
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / "proxy.log"
+
+    handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=1_000_000, backupCount=3
+    )
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    handler.setFormatter(formatter)
+
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+
+# ---------------------------------------------------------------------------
+# Patch loading and application
+# ---------------------------------------------------------------------------
+
+
+def load_patches() -> list[dict]:
+    script_dir = Path(__file__).resolve().parent
+    patches_file = script_dir / "patches.json"
+    if patches_file.is_file():
+        log.info("Loading patches from %s", patches_file)
+        with open(patches_file) as f:
+            patches = json.load(f)
+        log.info("Loaded %d patches from file", len(patches))
+        return patches
+    log.info("Using %d built-in default patches", len(DEFAULT_PATCHES))
+    return DEFAULT_PATCHES
+
+
+def apply_patches(text: str, patches: list[dict]) -> tuple[str, int]:
+    """Apply replace patches to text. Returns (modified_text, count_applied)."""
+    applied = 0
+    for p in patches:
+        if "old" not in p:
+            continue  # skip add-type patches here
+        old = p["old"]
+        if old in text:
+            text = text.replace(old, p["new"])
+            applied += 1
+            log.debug("  Applied: %s", p["label"])
+        else:
+            log.debug("  Skipped (not found): %s", p["label"])
+    return text, applied
+
+
+def apply_add_patches(system_text: str, patches: list[dict]) -> tuple[str, int]:
+    """Apply add-type patches. Appends text if the 'unless' string is absent.
+
+    Patch format:
+        {
+            "label": "...",
+            "add": "text to inject",
+            "unless": "don't add if this string is already present"
+        }
+
+    The 'unless' field prevents duplicates. If omitted, the 'add' text
+    itself is used as the duplicate check.
+    """
+    applied = 0
+    for p in patches:
+        if "add" not in p:
+            continue  # skip replace-type patches here
+        check = p.get("unless", p["add"])
+        if check in system_text:
+            log.debug("  Skipped (already present): %s", p["label"])
+            continue
+        system_text = system_text + "\n\n" + p["add"]
+        applied += 1
+        log.debug("  Injected: %s", p["label"])
+    return system_text, applied
+
+
+def rewrite_body(body: bytes, patches: list[dict]) -> tuple[bytes, int]:
+    """Parse JSON body, patch the system field, return (modified_bytes, count)."""
+    data = json.loads(body)
+    system = data.get("system")
+    if system is None:
+        return body, 0
+
+    total_applied = 0
+
+    if isinstance(system, str):
+        data["system"], count = apply_patches(system, patches)
+        total_applied += count
+        data["system"], count = apply_add_patches(data["system"], patches)
+        total_applied += count
+    elif isinstance(system, list):
+        # Replace patches run on every text block
+        for block in system:
+            if isinstance(block, dict) and block.get("type") == "text":
+                block["text"], count = apply_patches(block["text"], patches)
+                total_applied += count
+
+        # Add patches inject into the largest text block (the main prompt)
+        add_patches = [p for p in patches if "add" in p]
+        if add_patches:
+            biggest = max(
+                (b for b in system if isinstance(b, dict) and b.get("type") == "text"),
+                key=lambda b: len(b.get("text", "")),
+                default=None,
+            )
+            if biggest is not None:
+                biggest["text"], count = apply_add_patches(biggest["text"], add_patches)
+                total_applied += count
+
+    return json.dumps(data, ensure_ascii=False).encode(), total_applied
+
+
+# ---------------------------------------------------------------------------
+# Prompt version logging — captures the raw system prompt once per version
+# ---------------------------------------------------------------------------
+
+import re
+
+_PROMPT_DIR = Path.home() / ".claude-proxy" / "prompts"
+
+
+def _parse_version(user_agent: str) -> str | None:
+    """Extract version from 'claude-cli/2.1.110 (external, sdk-cli)'."""
+    m = re.match(r"claude-cli/([\d.]+)", user_agent or "")
+    return m.group(1) if m else None
+
+
+def _log_prompt_if_new(version: str, body: bytes) -> str:
+    """Save each unique system prompt to disk, keyed by version + content hash.
+    Different API calls carry different prompts (title gen, main conversation,
+    explore agent, etc.) — we keep them all.
+    Returns a short status string for logging."""
+    import hashlib
+
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return "skipped (body not valid JSON)"
+
+    system = data.get("system")
+    if system is None:
+        return "skipped (no system field)"
+
+    # Hash the system content to deduplicate
+    system_bytes = json.dumps(system, ensure_ascii=False, sort_keys=True).encode()
+    content_hash = hashlib.sha256(system_bytes).hexdigest()[:8]
+
+    prompt_file = _PROMPT_DIR / f"v{version}_{content_hash}.json"
+    if prompt_file.exists():
+        return f"skipped (already on disk: {content_hash})"
+
+    # Extract system prompt blocks (pre-patch, this is the original text)
+    if isinstance(system, str):
+        prompt_data = {"text": system}
+        system_chars = len(system)
+    elif isinstance(system, list):
+        prompt_data = {"blocks": system}
+        system_chars = sum(
+            len(b.get("text", "")) for b in system if isinstance(b, dict)
+        )
+    else:
+        return f"skipped (system type: {type(system).__name__})"
+
+    import datetime
+
+    prompt_data["version"] = version
+    prompt_data["model"] = data.get("model")
+    prompt_data["system_chars"] = system_chars
+    prompt_data["content_hash"] = content_hash
+    prompt_data["captured"] = datetime.datetime.now().isoformat(timespec="seconds")
+
+    _PROMPT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(prompt_file, "w") as f:
+        json.dump(prompt_data, f, indent=2, ensure_ascii=False)
+
+    return f"saved {system_chars} chars -> {prompt_file.name}"
+
+
+_http_client: "httpx.Client | None" = None
+
+
+# ---------------------------------------------------------------------------
+# Proxy handler
+# ---------------------------------------------------------------------------
+
+
+class ProxyHandler(http.server.BaseHTTPRequestHandler):
+    patches: list[dict] = []
+
+    def _proxy(self) -> None:
+        import time
+
+        t0 = time.monotonic()
+
+        # Read request body if present
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b""
+
+        # Rewrite system prompt for POST /v1/messages
+        is_messages = self.command == "POST" and self.path.startswith("/v1/messages")
+        patch_count = 0
+        if is_messages and body:
+            # Log the raw prompt BEFORE patching, once per version
+            try:
+                ua = self.headers.get("User-Agent", "")
+                version = _parse_version(ua)
+                if version:
+                    result = _log_prompt_if_new(version, body)
+                    log.info("Prompt log v%s: %s", version, result)
+                else:
+                    log.debug("No version in User-Agent: %s", ua[:80])
+            except Exception:
+                log.exception("Failed to log prompt version")
+
+            try:
+                body, patch_count = rewrite_body(body, self.patches)
+            except Exception:
+                log.exception("Failed to rewrite request body, forwarding unchanged")
+
+        # Build upstream headers — skip hop-by-hop, fix Host and Content-Length
+        fwd_headers = {}
+        for key, value in self.headers.items():
+            lower = key.lower()
+            if lower in ("host", "connection", "keep-alive", "transfer-encoding"):
+                continue
+            if lower == "content-length":
+                fwd_headers[key] = str(len(body))
+            else:
+                fwd_headers[key] = value
+        fwd_headers["Host"] = UPSTREAM_HOST
+        if body:
+            fwd_headers["Content-Length"] = str(len(body))
+
+        # Forward to Anthropic via httpx (HTTP/2, persistent connections,
+        # connection pooling, keepalive — all handled automatically).
+        url = f"https://{UPSTREAM_HOST}{self.path}"
+        try:
+            upstream = _http_client.send(
+                _http_client.build_request(
+                    self.command, url,
+                    headers=fwd_headers,
+                    content=body or None,
+                ),
+                stream=True,
+            )
+        except Exception:
+            elapsed = time.monotonic() - t0
+            log.exception(
+                "%s %s -> 502 (upstream error) %.1fs", self.command, self.path, elapsed
+            )
+            self.send_error(502, "Bad Gateway")
+            return
+
+        elapsed = time.monotonic() - t0
+        if is_messages:
+            log.info(
+                "%s %s -> %d (patched %d/%d) %.1fs",
+                self.command,
+                self.path,
+                upstream.status_code,
+                patch_count,
+                len(self.patches),
+                elapsed,
+            )
+        else:
+            log.info(
+                "%s %s -> %d %.1fs",
+                self.command, self.path, upstream.status_code, elapsed,
+            )
+
+        # Stream response back to the client over HTTP/1.1.
+        # httpx gives us decoded bytes; we re-chunk for the HTTP/1.1 client.
+        try:
+            self.send_response_only(upstream.status_code)
+            # Forward response headers, skip HTTP/2 pseudo-headers
+            for key, value in upstream.headers.multi_items():
+                lower = key.lower()
+                if lower in ("connection", "keep-alive", "transfer-encoding"):
+                    continue
+                self.send_header(key, value)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
+            for chunk in upstream.iter_raw():
+                if not chunk:
+                    continue
+                self.wfile.write(f"{len(chunk):x}\r\n".encode())
+                self.wfile.write(chunk)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass  # client disconnected
+        finally:
+            upstream.close()
+
+    # Route all HTTP methods through _proxy
+    do_GET = _proxy
+    do_POST = _proxy
+    do_PUT = _proxy
+    do_DELETE = _proxy
+    do_PATCH = _proxy
+    do_HEAD = _proxy
+    do_OPTIONS = _proxy
+
+    # Redirect BaseHTTPRequestHandler's default stderr logging to our logger
+    def log_message(self, format, *args):
+        log.debug(format, *args)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+if IS_WINDOWS:
+    NPM_VERSIONS_DIR = Path(os.environ.get("APPDATA", Path.home() / "AppData/Roaming")) / "claude-npm/node_modules/@anthropic-ai/claude-code"
+else:
+    NPM_VERSIONS_DIR = Path.home() / ".local/share/claude-npm/node_modules/@anthropic-ai/claude-code"
+
+
+def find_claude_bin(requested_version: str | None = None) -> tuple[str, list[str]]:
+    """Resolve the claude binary to use.
+    Returns (binary_path, prefix_args) where prefix_args is empty for
+    native binaries and ['node', 'cli.js'] for npm installs.
+    """
+    if requested_version:
+        # Check for npm-installed version
+        cli_js = NPM_VERSIONS_DIR / "cli.js"
+        if cli_js.is_file():
+            pkg_json = NPM_VERSIONS_DIR / "package.json"
+            if pkg_json.is_file():
+                with open(pkg_json) as f:
+                    installed_ver = json.load(f).get("version", "")
+                if installed_ver != requested_version:
+                    npm_prefix = NPM_VERSIONS_DIR.parent.parent.parent
+                    print(
+                        f"Error: requested v{requested_version} but npm has "
+                        f"v{installed_ver}. Run:\n"
+                        f"  npm install --prefix \"{npm_prefix}\" "
+                        f"@anthropic-ai/claude-code@{requested_version}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+            node_bin = shutil.which("node")
+            if not node_bin:
+                print("Error: 'node' not found in PATH", file=sys.stderr)
+                sys.exit(1)
+            return node_bin, [str(cli_js)]
+        else:
+            npm_prefix = NPM_VERSIONS_DIR.parent.parent.parent
+            print(
+                f"Error: npm install not found. Run:\n"
+                f"  npm install --prefix \"{npm_prefix}\" "
+                f"@anthropic-ai/claude-code@{requested_version}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # Default: use native claude from PATH
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        print("Error: 'claude' not found in PATH", file=sys.stderr)
+        sys.exit(1)
+    return claude_bin, []
+
+
+def main() -> None:
+    # Parse our own flags, pass the rest to claude
+    verbose = "--verbose" in sys.argv
+    claude_version = None
+    claude_args = []
+    for a in sys.argv[1:]:
+        if a == "--verbose":
+            continue
+        if a.startswith("--claude-version="):
+            claude_version = a.split("=", 1)[1]
+            continue
+        claude_args.append(a)
+
+    setup_logging(verbose)
+
+    # Find claude binary
+    claude_bin, prefix_args = find_claude_bin(claude_version)
+    if claude_version:
+        log.info("Using npm Claude Code v%s: %s", claude_version, claude_bin)
+
+    # If settings.json has effortLevel "high" and the user didn't already
+    # pass --effort, escalate to --effort max.
+    if "--effort" not in " ".join(claude_args):
+        settings_file = Path.home() / ".claude" / "settings.json"
+        try:
+            if settings_file.is_file():
+                with open(settings_file) as f:
+                    settings = json.load(f)
+                if settings.get("effortLevel") == "high":
+                    claude_args = ["--effort", "max"] + claude_args
+                    log.info("effortLevel=high in settings, added --effort max")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Load patches
+    patches = load_patches()
+    ProxyHandler.patches = patches
+
+    # Start HTTP server on dynamic port.
+    # Override handle_error to suppress noisy tracebacks when the client
+    # disconnects mid-request (ConnectionResetError, BrokenPipeError).
+    class QuietHTTPServer(http.server.HTTPServer):
+        def handle_error(self, request, client_address):
+            exc_type = sys.exc_info()[0]
+            if exc_type in (BrokenPipeError, ConnectionResetError,
+                            ConnectionAbortedError):
+                log.debug("Client %s disconnected", client_address[0])
+            else:
+                log.exception("Error handling request from %s", client_address[0])
+
+    server = QuietHTTPServer(("127.0.0.1", 0), ProxyHandler)
+    port = server.server_address[1]
+    log.info("Proxy started on 127.0.0.1:%d (pid %d)", port, os.getpid())
+
+    # httpx client — HTTP/2, persistent connection pool, automatic keepalive.
+    # No manual ping thread needed; httpx manages connection lifecycle.
+    import httpx
+
+    global _http_client
+    _http_client = httpx.Client(
+        http2=True,
+        timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0),
+    )
+
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    # Set up signal forwarding BEFORE spawning claude to avoid a race
+    # where SIGINT arrives between spawn and handler registration.
+    proc = None
+
+    if IS_WINDOWS:
+        # On Windows, Ctrl+C sends CTRL_C_EVENT to all processes sharing
+        # the console. We spawn claude in a new process group so only we
+        # receive it, then forward explicitly via CTRL_C_EVENT.
+        def forward_signal(signum, _frame):
+            if proc is not None:
+                try:
+                    os.kill(proc.pid, signal.CTRL_C_EVENT)
+                except (ProcessLookupError, OSError):
+                    pass
+
+        signal.signal(signal.SIGINT, forward_signal)
+        try:
+            signal.signal(signal.SIGBREAK, forward_signal)
+        except (AttributeError, OSError):
+            pass
+
+        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        def forward_signal(signum, _frame):
+            if proc is not None:
+                try:
+                    proc.send_signal(signum)
+                except ProcessLookupError:
+                    pass
+
+        signal.signal(signal.SIGINT, forward_signal)
+        signal.signal(signal.SIGTERM, forward_signal)
+        creation_flags = 0
+
+    # Spawn claude with ANTHROPIC_BASE_URL pointing at our proxy
+    env = os.environ.copy()
+    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+
+    proc = subprocess.Popen(
+        [claude_bin] + prefix_args + claude_args,
+        env=env,
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        creationflags=creation_flags,
+    )
+
+    # Wait for claude to exit
+    rc = proc.wait()
+    log.info("Claude exited with code %d, shutting down proxy", rc)
+
+    _http_client.close()
+    server.shutdown()
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()
