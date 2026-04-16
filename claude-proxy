@@ -377,23 +377,49 @@ def _log_prompt_if_new(version: str, body: bytes) -> str:
     if system is None:
         return "skipped (no system field)"
 
-    # Hash the system content to deduplicate
-    system_bytes = json.dumps(system, ensure_ascii=False, sort_keys=True).encode()
-    content_hash = hashlib.sha256(system_bytes).hexdigest()[:8]
+    # Hash on the main prompt text only (the largest block), not the billing
+    # header which contains a per-request cch= value that changes every call.
+    # Strip the "# Environment" section which contains per-session runtime
+    # data (working dir, git status, model name) that changes every session.
+    if isinstance(system, list):
+        texts = [b.get("text", "") for b in system if isinstance(b, dict)]
+        hashable = max(texts, key=len) if texts else ""
+    else:
+        hashable = system
+    env_marker = "\n# Environment"
+    if env_marker in hashable:
+        hashable = hashable[:hashable.index(env_marker)]
+    content_hash = hashlib.sha256(hashable.encode()).hexdigest()[:8]
 
-    prompt_file = _PROMPT_DIR / f"v{version}_{content_hash}.json"
+    model = data.get("model", "unknown")
+    # Shorten model name: "claude-opus-4-6" -> "opus", "claude-haiku-4-5-20251001" -> "haiku"
+    short_model = model.split("-")[1] if "-" in model else model
+
+    prompt_file = _PROMPT_DIR / f"v{version}_{short_model}_{content_hash}.json"
     if prompt_file.exists():
-        return f"skipped (already on disk: {content_hash})"
+        return f"skipped (already on disk: {short_model}_{content_hash})"
 
-    # Extract system prompt blocks (pre-patch, this is the original text)
+    # Extract system prompt blocks (pre-patch, this is the original text).
+    # Strip the Environment section from the stored text — it's per-session
+    # runtime data (git status, working dir, model) not prompt content.
     if isinstance(system, str):
+        if env_marker in system:
+            system = system[:system.index(env_marker)]
         prompt_data = {"text": system}
         system_chars = len(system)
     elif isinstance(system, list):
-        prompt_data = {"blocks": system}
-        system_chars = sum(
-            len(b.get("text", "")) for b in system if isinstance(b, dict)
-        )
+        clean_blocks = []
+        system_chars = 0
+        for block in system:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block["text"]
+                if env_marker in text:
+                    text = text[:text.index(env_marker)]
+                clean_blocks.append({**block, "text": text})
+                system_chars += len(text)
+            else:
+                clean_blocks.append(block)
+        prompt_data = {"blocks": clean_blocks}
     else:
         return f"skipped (system type: {type(system).__name__})"
 
