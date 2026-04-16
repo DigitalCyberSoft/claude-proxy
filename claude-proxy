@@ -238,15 +238,33 @@ def setup_logging(verbose: bool = False) -> None:
 
 def load_patches() -> list[dict]:
     script_dir = Path(__file__).resolve().parent
+
+    # Load base patches (patches.json or built-in defaults)
     patches_file = script_dir / "patches.json"
     if patches_file.is_file():
         log.info("Loading patches from %s", patches_file)
         with open(patches_file) as f:
             patches = json.load(f)
-        log.info("Loaded %d patches from file", len(patches))
-        return patches
-    log.info("Using %d built-in default patches", len(DEFAULT_PATCHES))
-    return DEFAULT_PATCHES
+        log.info("Loaded %d patches from patches.json", len(patches))
+    else:
+        patches = list(DEFAULT_PATCHES)
+        log.info("Using %d built-in default patches", len(patches))
+
+    # Append user's local patches (not tracked in git, survives updates)
+    local_file = script_dir / "patches.local.json"
+    if local_file.is_file():
+        with open(local_file) as f:
+            local = json.load(f)
+        if local:
+            patches.extend(local)
+            log.info("Loaded %d local patches from patches.local.json", len(local))
+    else:
+        # Create a skeleton so users know the file exists
+        with open(local_file, "w") as f:
+            f.write("[\n]\n")
+        log.info("Created empty patches.local.json — add your own patches here")
+
+    return patches
 
 
 def apply_patches(text: str, patches: list[dict]) -> tuple[str, int]:
@@ -395,6 +413,8 @@ def _log_prompt_if_new(version: str, body: bytes) -> str:
 
 
 _http_client: "httpx.Client | None" = None
+_banner_shown = False
+_banner_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +437,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # Rewrite system prompt for POST /v1/messages
         is_messages = self.command == "POST" and self.path.startswith("/v1/messages")
         patch_count = 0
+        system_size = 0
         if is_messages and body:
             # Log the raw prompt BEFORE patching, once per version
             try:
@@ -429,6 +450,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     log.debug("No version in User-Agent: %s", ua[:80])
             except Exception:
                 log.exception("Failed to log prompt version")
+
+            system_size = len(body)
 
             try:
                 body, patch_count = rewrite_body(body, self.patches)
@@ -480,6 +503,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 len(self.patches),
                 elapsed,
             )
+            # Show a one-time banner on the first main conversation request
+            # (system_size > 50K distinguishes it from title-gen and other
+            # small internal calls that carry fewer prompt components).
+            global _banner_shown
+            if patch_count > 0 and system_size > 50000 and not _banner_shown:
+                with _banner_lock:
+                    if not _banner_shown:
+                        _banner_shown = True
+                        print(
+                            f"\033[90mclaude-proxy: {patch_count}/{len(self.patches)}"
+                            f" patches applied\033[0m",
+                            file=sys.stderr, flush=True,
+                        )
         else:
             log.info(
                 "%s %s -> %d %.1fs",

@@ -90,6 +90,29 @@ Both types support `_meta` for provenance. The proxy ignores it. It's there so y
 
 Current patch count: 16 (13 replace, 3 add). The replace patches are roman01la's 11 originals adapted for current + legacy versions, plus 2 for the replacement communication-style prompt. The 3 add patches inject roman01la's core philosophy directly into the main prompt: choose correctness over simplicity, brevity applies to messages not work quality, and implementation thoroughness is exempt from communication style rules.
 
+## patches.local.json
+
+Your own patches go in `patches.local.json`. This file is gitignored so it survives `git pull` when `patches.json` gets updated for new Claude Code versions.
+
+Same format as `patches.json`. Both replace and add patches work. Local patches are loaded after the main patches and appended to the list, so they run last.
+
+```json
+[
+    {
+        "label": "My custom instruction",
+        "add": "When writing tests, always include edge cases for empty inputs and null values.",
+        "unless": "edge cases for empty inputs"
+    },
+    {
+        "label": "Soften the no-comments rule further",
+        "old": "In code: default to writing no comments.",
+        "new": "In code: add comments where they help future readers understand non-obvious decisions."
+    }
+]
+```
+
+Put your customizations here, not in `patches.json`. When a new Claude Code version changes prompt text, you update `patches.json` (or pull the update from the repo) and your local patches stay untouched.
+
 ## Installing an npm version
 
 The native binary and the npm package contain identical code. The npm version lets you pin a specific release.
@@ -109,8 +132,9 @@ v2.1.98 is the last version where all 11 original roman01la patches match. v2.1.
 ## Files
 
 ```
-claude-proxy      - the proxy (single Python 3 file, requires httpx[http2])
-patches.json      - prompt replacements and injections with full provenance metadata
+claude-proxy         - the proxy (single Python 3 file, requires httpx[http2])
+patches.json         - project-maintained patches with full provenance metadata
+patches.local.json   - your patches (gitignored, created on first run if missing)
 ```
 
 Runtime files:
@@ -208,8 +232,10 @@ IMPORTANT RULES:
   - Keep the patches.json version-universal. Don't delete old-version patches,
     just add new ones alongside them.
   - Every patch needs a _meta field documenting its origin and provenance.
-  - Write to patches.json, not to the DEFAULT_PATCHES in the Python script.
-    patches.json overrides the built-in defaults when present.
+  - Write project patches to patches.json, not to the DEFAULT_PATCHES in
+    the Python script. patches.json overrides the built-in defaults.
+  - Do NOT touch patches.local.json — that's the user's personal patches.
+    It's loaded separately and appended after patches.json.
 
 PATCH TYPES:
   Replace patches have "old" and "new" fields. They find and swap text.
@@ -236,11 +262,16 @@ Find the exact text in the current system prompts to verify it exists. Check:
 1. The captured prompts in ~/.claude-proxy/prompts/ (most authoritative)
 2. The tweakcc prompt extractions if needed for component ID identification
 
-Then add it to patches.json with a proper _meta field including:
+Add it to patches.local.json (for personal patches) or patches.json (for
+project-maintained patches) with a proper _meta field including:
 - A label describing what the patch does and why
 - The prompt component ID it targets
 - The version range where this text exists
 - Today's date as the verification date
+
+patches.local.json is gitignored and won't be overwritten by git pull.
+Use it for anything specific to your workflow. patches.json is for patches
+that should ship with the project.
 
 Test with: ./claude-proxy --verbose --print "say hello"
 Check the log to verify "Applied:" appears for the new patch.
@@ -250,8 +281,8 @@ Check the log to verify "Applied:" appears for the new patch.
 
 ```
 I want to inject a custom instruction into Claude Code's system prompt
-via this project's patches.json. This instruction should be added if it's
-not already present, regardless of what else is in the prompt.
+via this project. This instruction should be added if it's not already
+present, regardless of what else is in the prompt.
 
 INSTRUCTION TO INJECT:
 [paste the text you want appended to the system prompt]
@@ -260,11 +291,13 @@ DUPLICATE CHECK (optional - a short unique phrase from the instruction
 that can be used to detect if it's already present):
 [paste a phrase, or leave blank to use the full instruction text]
 
-Add it to patches.json as an add-type patch with:
+Add it to patches.local.json as an add-type patch with:
 - "add": the instruction text
 - "unless": the duplicate check phrase
 - "label": a short description of what this does
-- "_meta": origin and rationale
+
+Use patches.local.json for personal patches (gitignored, survives updates).
+Use patches.json only for project-maintained patches that should be shared.
 
 Add patches append to the largest text block in the system prompt array
 (the main conversation prompt, ~26K chars). They fire on every API call
