@@ -61,10 +61,11 @@
             "prompt_id": "system-prompt-doing-tasks-no-additions",
             "prompt_introduced": "v2.1.53 (2026-02-24)",
             "prompt_text_unchanged_since": "v2.1.53 (2026-02-24)",
-            "verified_present_through": "v2.1.107 (2026-04-14)",
-            "fix_applied": "Unicode curly quotes (\\u2019 \\u201c \\u201d) replaced with ASCII apostrophes/quotes to match actual API text. Original roman01la patch used JS runtime unicode output; the proxy sees ASCII."
+            "verified_present_through": "v2.1.110 (2026-04-15). REMOVED in v2.1.112 (2026-04-16) where the bullet was merged with system-prompt-doing-tasks-no-premature-abstractions into a single combined bullet.",
+            "fix_applied": "Unicode curly quotes (\\u2019 \\u201c \\u201d) replaced with ASCII apostrophes/quotes to match actual API text. Original roman01la patch used JS runtime unicode output; the proxy sees ASCII.",
+            "notes": "Skipped automatically on v2.1.112+. The merged-bullet replacement patch lives below as 'Anti-gold-plating + abstractions merged'."
         },
-        "label": "Anti-gold-plating \u2014 allow adjacent fixes (roman01la #4)",
+        "label": "Anti-gold-plating \u2014 allow adjacent fixes (roman01la #4, <=v2.1.110)",
         "old": "Don't add features, refactor code, or make \"improvements\" beyond what was asked. A bug fix doesn't need surrounding code cleaned up. A simple feature doesn't need extra configurability. Don't add docstrings, comments, or type annotations to code you didn't change. Only add comments where the logic isn't self-evident.",
         "new": "Don't add unrelated features or speculative improvements. However, if adjacent code is broken, fragile, or directly contributes to the problem being solved, fix it as part of the task. A bug fix should address related issues discovered during investigation. Don't add docstrings, comments, or type annotations to code you didn't change. Only add comments where the logic isn't self-evident."
     },
@@ -74,7 +75,7 @@
             "prompt_id": "system-prompt-doing-tasks-no-unnecessary-error-handling",
             "prompt_introduced": "v2.1.53 (2026-02-24)",
             "prompt_text_unchanged_since": "v2.1.53 (2026-02-24)",
-            "verified_present_through": "v2.1.107 (2026-04-14)",
+            "verified_present_through": "v2.1.112 (2026-04-16)",
             "fix_applied": "Unicode curly quotes replaced with ASCII. Same fix as #4."
         },
         "label": "Error handling \u2014 stop skipping it (roman01la #5)",
@@ -87,12 +88,27 @@
             "prompt_id": "system-prompt-doing-tasks-no-premature-abstractions",
             "prompt_introduced": "v2.1.53 (2026-02-24), text updated v2.1.86 (2026-03-27) to add the 'Three similar lines' sentence",
             "prompt_text_unchanged_since": "v2.1.86 (2026-03-27)",
-            "verified_present_through": "v2.1.107 (2026-04-14)",
-            "fix_applied": "None needed — already pure ASCII. Was not matching in proxy logs because this prompt is only included in API calls for coding tasks, not the initial session setup call."
+            "verified_present_through": "v2.1.110 (2026-04-15). REMOVED in v2.1.112 (2026-04-16) where the bullet was merged with system-prompt-doing-tasks-no-additions; the new wording is 'Three similar lines is better than a premature abstraction' (no 'of code').",
+            "fix_applied": "None needed — already pure ASCII. Skipped automatically on v2.1.112+ where the wording changed and the bullet moved.",
+            "notes": "The merged-bullet replacement patch lives below as 'Anti-gold-plating + abstractions merged'."
         },
-        "label": "Three-lines rule removed (roman01la #6)",
+        "label": "Three-lines rule removed (roman01la #6, <=v2.1.110)",
         "old": "Three similar lines of code is better than a premature abstraction.",
         "new": "Use judgment about when to extract shared logic. Avoid premature abstractions for hypothetical reuse, but do extract when duplication causes real maintenance risk."
+    },
+    {
+        "_meta": {
+            "origin": "roman01la patch #4 (Anti-gold-plating) + #6 (Three-lines rule) \u2014 MERGED in v2.1.112",
+            "spirit": "In v2.1.112 (2026-04-16) the anti-gold-plating bullet (formerly system-prompt-doing-tasks-no-additions) and the three-lines bullet (formerly system-prompt-doing-tasks-no-premature-abstractions) were collapsed into a single bullet under '# Doing tasks'. The two old patches above still apply to v2.1.110 and earlier; this patch targets the v2.1.112+ merged bullet to preserve both spirits in one replacement.",
+            "merged_text_v2.1.112": "Don't add features, refactor, or introduce abstractions beyond what the task requires. A bug fix doesn't need surrounding cleanup; a one-shot operation doesn't need a helper. Don't design for hypothetical future requirements. Three similar lines is better than a premature abstraction. No half-finished implementations either.",
+            "prompt_id": "no longer separately extracted by tweakcc as of v2.1.112; lives inline in the '# Doing tasks' bullet list",
+            "prompt_introduced": "v2.1.112 (2026-04-16) as a merged single bullet",
+            "verified_present_through": "v2.1.112 (2026-04-16)",
+            "fix_applied": "New patch targeting the merged bullet. Preserves roman01la #4 spirit (allow adjacent/related fixes during a bug fix) and roman01la #6 spirit (don't blanket-ban abstraction extraction). Note: 'a one-shot operation doesn't need a helper' is intentionally dropped from the replacement \u2014 it overlaps with #6 spirit and the new wording is more nuanced."
+        },
+        "label": "Anti-gold-plating + abstractions merged (roman01la #4+#6, v2.1.112+)",
+        "old": "Don't add features, refactor, or introduce abstractions beyond what the task requires. A bug fix doesn't need surrounding cleanup; a one-shot operation doesn't need a helper. Don't design for hypothetical future requirements. Three similar lines is better than a premature abstraction. No half-finished implementations either.",
+        "new": "Don't add unrelated features or speculative improvements. If adjacent code is broken, fragile, or directly contributes to the problem being solved, fix it as part of the task \u2014 a bug fix should address related issues discovered during investigation. Use judgment about when to extract shared logic: avoid premature abstractions for hypothetical reuse, but do extract when duplication causes real maintenance risk. No half-finished implementations."
     },
     {
         "_meta": {
@@ -100,9 +116,9 @@
             "prompt_id": "agent-prompt-general-purpose",
             "prompt_introduced": "v2.1.86 (2026-03-27) — this prompt did not exist before v2.1.86",
             "prompt_text_unchanged_since": "v2.1.86 (2026-03-27)",
-            "verified_present_through": "v2.1.107 (2026-04-14)",
+            "verified_present_through": "v2.1.112 (2026-04-16)",
             "fix_applied": "Unicode curly quotes replaced with ASCII. Em dash (\\u2014) retained — it matches in both source and API text.",
-            "notes": "This prompt is only sent when spawning a general-purpose subagent, not in the main conversation."
+            "notes": "This prompt is only sent when spawning a general-purpose subagent, not in the main conversation. v2.1.112 verification: target text confirmed present in tweakcc prompts-2.1.112.json under id agent-prompt-general-purpose."
         },
         "label": "Subagent completeness strengthened (roman01la #7)",
         "old": "Complete the task fully\u2014don't gold-plate, but don't leave it half-done.",
@@ -114,9 +130,9 @@
             "prompt_id": "agent-prompt-explore",
             "prompt_introduced": "v2.0.56, significantly rewritten v2.1.84 (2026-03-25)",
             "prompt_text_unchanged_since": "v2.1.84 (2026-03-25)",
-            "verified_present_through": "v2.1.107 (2026-04-14)",
+            "verified_present_through": "v2.1.112 (2026-04-16)",
             "fix_applied": "Unicode curly quote in 'user\\u2019s' replaced with ASCII apostrophe 'user's'.",
-            "notes": "Only sent when spawning an Explore subagent. The prompt structure uses template variables (GLOB_TOOL_NAME, GREP_TOOL_NAME, etc.) but the target text is in a static string piece at the end."
+            "notes": "Only sent when spawning an Explore subagent. The prompt structure uses template variables (GLOB_TOOL_NAME, GREP_TOOL_NAME, etc.) but the target text is in a static string piece at the end. v2.1.112 verification: target text confirmed present in tweakcc prompts-2.1.112.json under id agent-prompt-explore."
         },
         "label": "Explore agent \u2014 thoroughness over speed (roman01la #8)",
         "old": "NOTE: You are meant to be a fast agent that returns output as quickly as possible. In order to achieve this you must:\n- Make efficient use of the tools that you have at your disposal: be smart about how you search for files and implementations\n- Wherever possible you should try to spawn multiple parallel tool calls for grepping and reading files\n\nComplete the user's search request efficiently and report your findings clearly.",
@@ -128,7 +144,7 @@
             "prompt_id": "system-prompt-tone-concise-output-short",
             "prompt_introduced": "v2.1.53 (2026-02-24)",
             "prompt_text_unchanged_since": "v2.1.53 (2026-02-24)",
-            "verified_present_through": "v2.1.107 (2026-04-14)",
+            "verified_present_through": "v2.1.112 (2026-04-16)",
             "fix_applied": "None needed — already pure ASCII. This was the ONLY patch that was working in the proxy before this update.",
             "notes": "This is a tiny prompt — the full text is just the 'old' string. It appears in every API call."
         },
@@ -142,9 +158,9 @@
             "prompt_id": "system-prompt-agent-thread-notes",
             "prompt_introduced": "v2.1.69 (2026-03-04), text updated v2.1.84 (2026-03-25), updated again v2.1.97 (2026-04-08)",
             "prompt_text_unchanged_since": "v2.1.97 (2026-04-08)",
-            "verified_present_through": "v2.1.107 (2026-04-14)",
+            "verified_present_through": "v2.1.112 (2026-04-16)",
             "fix_applied": "None needed — em dash (\\u2014) matches in both environments. Was not matching because this prompt is only sent for subagent API calls.",
-            "notes": "Only included in API calls when Claude is running as a subagent thread."
+            "notes": "Only included in API calls when Claude is running as a subagent thread. v2.1.112 verification: target text confirmed present in tweakcc prompts-2.1.112.json under id system-prompt-agent-thread-notes."
         },
         "label": "Subagent code snippets \u2014 stop suppressing context (roman01la #10)",
         "old": "Include code snippets only when the exact text is load-bearing (e.g., a bug you found, a function signature the caller asked for) \u2014 do not recap code you merely read.",
@@ -156,7 +172,7 @@
             "prompt_id": "system-prompt-executing-actions-with-care",
             "prompt_introduced": "v2.1.32, text updated v2.1.78 (2026-03-17)",
             "prompt_text_unchanged_since": "v2.1.78 (2026-03-17)",
-            "verified_present_through": "v2.1.107 (2026-04-14)",
+            "verified_present_through": "v2.1.112 (2026-04-16)",
             "fix_applied": "None needed — already pure ASCII. Was not matching because this prompt may not be in every API call.",
             "notes": "This is a large prompt (2832 chars) about executing actions with care. The patch target is a single sentence near the end of the first paragraph."
         },
